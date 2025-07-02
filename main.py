@@ -1,6 +1,9 @@
 import asyncio
 import sys
 import re
+import json
+import datetime
+import os
 
 # 智慧依賴檢查
 def check_dependencies():
@@ -43,9 +46,10 @@ check_dependencies()
 # 現在可以安全導入
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
 
-async def extract_caption_from_meta(page) -> str:
+async def extract_caption_from_meta(page) -> tuple[str, str]:
     """
     從 meta 標籤中提取文案 - 優化版本
+    返回 (文案內容, 抓取方法)
     """
     try:
         # 嘗試從 og:description meta 標籤獲取
@@ -56,10 +60,10 @@ async def extract_caption_from_meta(page) -> str:
             # 匹配模式：用戶名 於 日期 : "文案內容"
             match = re.search(r':\s*"([^"]+)"', og_description)
             if match:
-                return match.group(1).strip()
+                return match.group(1).strip(), "meta_og_description"
             # 如果沒有引號格式，嘗試其他清理方式
             cleaned = re.sub(r'^[^:]+:\s*', '', og_description)
-            return cleaned.strip()
+            return cleaned.strip(), "meta_og_description"
         
         # 嘗試從 description meta 標籤獲取
         description = await page.get_attribute('meta[name="description"]', 'content')
@@ -68,20 +72,31 @@ async def extract_caption_from_meta(page) -> str:
             # 清理格式，提取引號內的內容
             match = re.search(r':\s*"([^"]+)"', description)
             if match:
-                return match.group(1).strip()
+                return match.group(1).strip(), "meta_description"
             # 如果沒有引號格式，嘗試其他清理方式
             cleaned = re.sub(r'^[^:]+:\s*', '', description)
-            return cleaned.strip()
+            return cleaned.strip(), "meta_description"
             
     except Exception as e:
         print(f"Meta 標籤抓取失敗: {e}")
     
-    return ""
+    return "", "failed"
 
-async def get_post_caption(url: str) -> str:
+async def get_post_caption(url: str) -> dict:
     """
     抓取Instagram貼文或Reels的文案，專注於右側文字內容
+    返回包含詳細信息的字典
     """
+    result = {
+        "url": url,
+        "timestamp": datetime.datetime.now().isoformat(),
+        "caption": "",
+        "success": False,
+        "method": "",
+        "length": 0,
+        "error": None
+    }
+    
     print("Launching browser in incognito mode...")
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=False)
@@ -99,6 +114,7 @@ async def get_post_caption(url: str) -> str:
 
             # --- 優化的抓取策略 ---
             caption = ""
+            method = ""
             
             # 策略 1: 優先從頁面元素抓取文案 (不需要點擊更多按鈕)
             try:
@@ -144,6 +160,7 @@ async def get_post_caption(url: str) -> str:
                                         # 選擇最長且有意義的文字
                                         if len(text) > len(caption):
                                             caption = text
+                                            method = f"page_element_{selector}"
                                             print(f"找到更好的文案 (長度: {len(text)}): {text[:100]}...")
                                 except Exception as e:
                                     continue
@@ -158,13 +175,18 @@ async def get_post_caption(url: str) -> str:
             # 策略 2: 如果頁面抓取失敗或抓到的內容太短，從 meta 標籤抓取
             if not caption or len(caption) < 30:
                 print("頁面元素抓取結果不理想，嘗試從 meta 標籤抓取...")
-                meta_caption = await extract_caption_from_meta(page)
+                meta_caption, meta_method = await extract_caption_from_meta(page)
                 if meta_caption and len(meta_caption) > len(caption):
                     caption = meta_caption
+                    method = meta_method
                     print(f"從 meta 標籤成功抓取文案 (長度: {len(caption)})")
             
             if caption and len(caption) > 10:
-                return caption
+                result["caption"] = caption
+                result["success"] = True
+                result["method"] = method
+                result["length"] = len(caption)
+                return result
             else:
                 # 最後的 debug 處理
                 print("所有策略都失敗，保存 debug 檔案...")
@@ -172,22 +194,43 @@ async def get_post_caption(url: str) -> str:
                 with open("debug_page.html", "w", encoding="utf-8") as f:
                     f.write(await page.content())
                 print("Debug 檔案已保存")
-                return "ERROR: 無法找到文案內容。請檢查 debug 檔案。"
+                result["error"] = "無法找到文案內容"
+                return result
 
         except PlaywrightTimeoutError:
             print("ERROR: 頁面載入或處理超時")
             await page.screenshot(path="debug_screenshot.png")
             with open("debug_page.html", "w", encoding="utf-8") as f:
                 f.write(await page.content())
-            return "ERROR: 頁面處理超時。請檢查 debug 檔案。"
+            result["error"] = "頁面處理超時"
+            return result
         except Exception as e:
             print(f"發生未預期的錯誤: {e}")
-            return f"ERROR: 發生未預期的錯誤: {e}"
+            result["error"] = f"未預期的錯誤: {str(e)}"
+            return result
         finally:
             print("Closing browser...")
             await context.close()
             await browser.close()
             print("Browser closed.")
+
+def save_to_json(result: dict, output_dir: str = "output") -> str:
+    """
+    將抓取結果保存為JSON文件
+    """
+    # 確保輸出目錄存在
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # 生成文件名（使用時間戳）
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"instagram_caption_{timestamp}.json"
+    filepath = os.path.join(output_dir, filename)
+    
+    # 保存JSON文件
+    with open(filepath, "w", encoding="utf-8") as f:
+        json.dump(result, f, ensure_ascii=False, indent=2)
+    
+    return filepath
 
 async def main():
     """
@@ -200,6 +243,7 @@ async def main():
         print("範例: python main.py https://www.instagram.com/p/C2x5J8zR9A9/")
         print("     python main.py https://www.instagram.com/reel/DLbk7VgOwPV/")
         print("\n💡 提示: 如果是第一次使用，請先執行 python setup.py 安裝依賴")
+        print("📁 抓取結果將自動保存為JSON文件到 output/ 目錄")
         return
 
     post_url = sys.argv[1]
@@ -209,12 +253,30 @@ async def main():
         return
 
     print(f"開始抓取: {post_url}")
-    caption_text = await get_post_caption(post_url)
+    result = await get_post_caption(post_url)
 
+    # 控制台輸出
     print("\n" + "="*50)
-    print("抓取到的文案:")
+    print("抓取結果:")
     print("="*50)
-    print(caption_text)
+    if result["success"]:
+        print("✅ 抓取成功!")
+        print(f"📝 文案長度: {result['length']} 字元")
+        print(f"🔧 抓取方法: {result['method']}")
+        print(f"⏰ 抓取時間: {result['timestamp']}")
+        print("\n📄 文案內容:")
+        print("-" * 30)
+        print(result["caption"])
+    else:
+        print("❌ 抓取失敗!")
+        print(f"🔴 錯誤信息: {result.get('error', '未知錯誤')}")
+    
+    # 保存JSON文件
+    json_filepath = save_to_json(result)
+    print("\n" + "="*50)
+    print("📁 JSON輸出:")
+    print("="*50)
+    print(f"✅ 結果已保存到: {json_filepath}")
     print("="*50 + "\n")
 
 if __name__ == "__main__":
